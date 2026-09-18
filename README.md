@@ -87,6 +87,46 @@ make
 - ✅ Bool 组合查询
 - ✅ 高亮显示
 - ✅ 分页查询
+- ✅ 分面搜索（命中列表 + 分面统计同一请求返回）
+
+### 分面搜索（选题筛选）
+
+面向"边看分类/作者/标签/日期的可选数量、边缩小范围"的场景，一次请求同时返回：
+
+- **命中列表**：应用关键词与全部已选分面条件，可同时返回高亮；
+- **各分面桶统计**：同一分面内多选按 **OR** 解释，不同分面之间按 **AND** 组合；
+- **下一步可选数量**：每个分面的桶在统计时保留关键词与*其他*分面条件、
+  排除*自身*过滤（避免已选分类把其他分类计数压成 0）——通过
+  `query`(关键词) + `post_filter`(命中) + 每分面 `filter` 聚合实现；
+- **日期范围**：明确的闭开边界 `[from, to)`（`gte` / `lt`）；
+- **稳定排序**：桶按数量降序，数量相同时按键名升序；
+- **零计数保留**：已选但未出现在桶中的值以 0 计数返回，界面可继续展示；
+- **参数校验**：非法字段、倒置/不存在的日期、超出 `index.max_result_window`
+  的分页会抛出 `es::ValidationException`，不会拼入查询发往 ES。
+
+```cpp
+es::FacetedSearchRequest req;
+req.keyword = "学习";                       // 无关键词时传空串即可
+req.facets = {
+    es::FacetSpec::keyword("category", {"技术"}),            // 同组 OR
+    es::FacetSpec::keyword("tags", {"深度学习", "神经网络"}),
+    es::FacetSpec::date("created_at", "2024-01-01", "2024-12-31"), // [from,to)
+};
+auto result = client.facetedSearch("articles", req);
+// result.total / result.hits(含 highlight) / result.facets[].buckets
+```
+
+### 集成测试
+
+分面搜索有端到端集成测试（真实 libcurl HTTP 链路 + 内存版 ES 测试替身
+`tests/mock_es_server.py`，仅用 Python 标准库），覆盖多选组合、零命中、
+无关键词、闭开日期边界、非法参数拦截、高亮与统计同回等场景：
+
+```bash
+cd backend
+cmake -S . -B build && cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
 ### 分词说明
 

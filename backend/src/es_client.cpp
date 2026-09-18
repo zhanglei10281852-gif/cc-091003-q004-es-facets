@@ -2,6 +2,8 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <algorithm>
+#include <set>
 
 namespace es {
 
@@ -265,13 +267,17 @@ SearchResult ESClient::parseSearchResponse(const json& response) {
     const auto& hits = response["hits"];
     const auto& total = hits["total"];
     result.total = total.is_object() ? total.value("value", 0) : total.get<int>();
-    result.maxScore = hits.value("max_score", 0.0);
-    
+    result.maxScore = hits["max_score"].is_number()
+                          ? hits["max_score"].get<double>()
+                          : 0.0;
+
     for (const auto& hit : hits["hits"]) {
         SearchHit searchHit;
         searchHit.id = hit.value("_id", "");
         searchHit.index = hit.value("_index", "");
-        searchHit.score = hit.value("_score", 0.0);
+        searchHit.score = hit["_score"].is_number()
+                              ? hit["_score"].get<double>()
+                              : 0.0;
         searchHit.source = hit.value("_source", json::object());
         searchHit.highlight = hit.value("highlight", json::object());
         result.hits.push_back(searchHit);
@@ -383,12 +389,382 @@ SearchResult ESClient::search(const std::string& indexName,
         buildUrl("/" + indexName + "/_search"),
         queryBody.dump()
     );
-    
+
     if (!response.isSuccess()) {
         throw ESException("Search failed: " + response.body);
     }
-    
+
     return parseSearchResponse(json::parse(response.body));
+}
+
+// ==================== 分面搜索 ====================
+
+bool ESClient::isValidFieldName(const std::string& name) {
+    // 拒绝空名、路径穿越、ES 字段名中不允许出现的字符，避免把非法字段拼进查询
+    if (name.empty() || name == "." || name == "..") {
+        return false;
+    }
+    static const std::string forbidden = "#:\\*?\"<>| ,/";
+    for (char c : name) {
+        if (static_cast<unsigned char>(c) < 0x20 ||
+            forbidden.find(c) != std::string::npos) {
+            return false;
+        }
+    }
+    if (name.front() == '.' || name.back() == '.') {
+        return false;
+    }
+    return true;
+}
+
+bool ESClient::isValidCalendarDate(const std::string& s) {
+    // 严格 yyyy-MM-dd，且必须是真实的日历日期（拒绝 2024-02-30 之类）
+    if (s.size() != 10) return false;
+    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u}) {
+        if (s[i] < '0' || s[i] > '9') return false;
+    }
+    if (s[4] != '-' || s[7] != '-') return false;
+
+    int year  = std::stoi(s.substr(0, 4));
+    int month = std::stoi(s.substr(5, 2));
+    int day   = std::stoi(s.substr(8, 2));
+    if (month < 1 || month > 12 || day < 1) return false;
+
+    static const int daysInMonth[] =
+        {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int maxDay = daysInMonth[month - 1];
+    bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    if (month == 2 && leap) maxDay = 29;
+    return day <= maxDay;
+}
+
+bool ESClient::isFacetActive(const FacetSpec& facet) {
+    if (facet.type == FacetFieldType::Date) {
+        return !facet.dateFrom.empty() || !facet.dateTo.empty();
+    }
+    return !facet.selected.empty();
+}
+
+std::string ESClient::facetAggName(const std::string& field) {
+    // 字段名已校验为合法标识符风格，聚合名可安全派生
+    return "facet_" + field;
+}
+
+json ESClient::buildKeywordClause(const std::string& keyword,
+                                  const std::vector<std::string>& fields) const {
+    if (keyword.empty()) {
+        return json();
+    }
+    std::vector<std::string> matchFields = fields;
+    if (matchFields.empty()) {
+        matchFields = {"title", "content"};
+    }
+    return json{{"multi_match", {
+        {"query", keyword},
+        {"fields", matchFields}
+    }}};
+}
+
+json ESClient::buildFacetFilter(const FacetSpec& facet) const {
+    if (facet.type == FacetFieldType::Date) {
+        // 明确的闭开区间 [dateFrom, dateTo)：gte 含下界，lt 不含上界
+        json range;
+        if (!facet.dateFrom.empty()) range["gte"] = facet.dateFrom;
+        if (!facet.dateTo.empty())   range["lt"]  = facet.dateTo;
+        return json{{"range", {{facet.field, range}}}};
+    }
+
+    std::vector<json> terms;
+    terms.reserve(facet.selected.size());
+    for (const auto& value : facet.selected) {
+        terms.push_back(json{{"term", {{facet.field, value}}}});
+    }
+    if (terms.size() == 1) {
+        return terms.front();
+    }
+    return json{{"bool", {{"should", terms}, {"minimum_should_match", 1}}}};
+}
+
+json ESClient::buildScopeQuery(const FacetedSearchRequest& request,
+                               const std::string& excludeField) const {
+    // 仅由“其他分面”的已选条件组成的过滤查询（不含关键词）。
+    // excludeField 对应分面自身的过滤被排除：
+    //   - excludeField == "" 时用于命中列表的 post_filter（全部分面条件）；
+    //   - 否则用于该分面的 filter 聚合（保留其他分面、排除自身）。
+    // 关键词放在顶层 query 中，对命中与所有聚合统一生效，故不在这里。
+    json filterClauses = json::array();
+    for (const auto& facet : request.facets) {
+        if (isFacetActive(facet) && facet.field != excludeField) {
+            filterClauses.push_back(buildFacetFilter(facet));
+        }
+    }
+
+    if (filterClauses.empty()) {
+        return json{{"match_all", json::object()}};
+    }
+    if (filterClauses.size() == 1) {
+        return filterClauses[0];
+    }
+    return json{{"bool", {{"filter", std::move(filterClauses)}}}};
+}
+
+json ESClient::buildFacetAggregation(const FacetSpec& facet,
+                                     const FacetedSearchRequest& request) const {
+    // 桶的作用域 = 关键词 + 其他分面过滤（排除自身），从而给出“下一步可选数量”
+    json agg;
+    json scope = buildScopeQuery(request, facet.field);
+
+    if (facet.type == FacetFieldType::Date) {
+        // 日期分面本身是范围过滤，聚合只需要返回作用域内的命中文档数，
+        // 前端据此展示当前范围下其他条件是否仍有命中。
+        agg["filter"] = scope;
+        return agg;
+    }
+
+    agg["filter"] = scope;
+    // 关键词不写进这里：它在顶层 query 中，对 filter 聚合同样生效（ES 的
+    // filter 聚合在外层查询上下文内求值）。这里的 filter 只保留“其他分面”。
+    // ES 默认按 doc_count 降序、相同计数按 key 升序，这里显式写死
+    agg["aggs"][facetAggName(facet.field)] = {
+        {"terms", {
+            {"field", facet.field},
+            {"size", facet.size},
+            {"order", json::array({
+                json{{"_count", "desc"}},
+                json{{"_key", "asc"}}
+            })}
+        }}
+    };
+    return agg;
+}
+
+void ESClient::validateFacetedRequest(const FacetedSearchRequest& request) const {
+    // 只允许在已建 mapping 的文本字段上做关键词检索
+    static const std::set<std::string> allowedKeywordFields =
+        {"title", "content"};
+    // 允许作为分面的字段及其类型（与 articles 索引 mapping 对应）
+    static const std::set<std::string> keywordFacetFields =
+        {"category", "author", "tags"};
+    static const std::set<std::string> dateFacetFields =
+        {"created_at"};
+
+    if (!request.keywordFields.empty()) {
+        for (const auto& field : request.keywordFields) {
+            if (!isValidFieldName(field) || !allowedKeywordFields.count(field)) {
+                throw ValidationException("非法的关键词字段名: " + field);
+            }
+        }
+    }
+
+    std::set<std::string> seenFacets;
+    for (const auto& facet : request.facets) {
+        if (!isValidFieldName(facet.field)) {
+            throw ValidationException("非法的分面字段名: " + facet.field);
+        }
+        bool typeValid = facet.type == FacetFieldType::Date
+                             ? static_cast<bool>(dateFacetFields.count(facet.field))
+                             : static_cast<bool>(keywordFacetFields.count(facet.field));
+        if (!typeValid) {
+            throw ValidationException(
+                "非法的分面字段或字段类型不匹配: " + facet.field);
+        }
+        if (!seenFacets.insert(facet.field).second) {
+            throw ValidationException("分面字段重复: " + facet.field);
+        }
+        if (facet.type == FacetFieldType::Keyword && facet.size < 1) {
+            throw ValidationException("词项分面 size 必须 >= 1: " + facet.field);
+        }
+        if (facet.type == FacetFieldType::Date) {
+            if (!facet.dateFrom.empty() && !isValidCalendarDate(facet.dateFrom)) {
+                throw ValidationException(
+                    "日期下界非法（应为 yyyy-MM-dd）: " + facet.dateFrom);
+            }
+            if (!facet.dateTo.empty() && !isValidCalendarDate(facet.dateTo)) {
+                throw ValidationException(
+                    "日期上界非法（应为 yyyy-MM-dd）: " + facet.dateTo);
+            }
+            if (!facet.dateFrom.empty() && !facet.dateTo.empty() &&
+                facet.dateFrom >= facet.dateTo) {
+                // 闭开区间要求 from < to，等值或倒置都没有意义
+                throw ValidationException(
+                    "日期区间倒置，要求 from < to（闭开区间 [" +
+                    facet.dateFrom + ", " + facet.dateTo + ")）");
+            }
+        } else {
+            std::set<std::string> dedup;
+            for (const auto& value : facet.selected) {
+                if (value.empty()) {
+                    throw ValidationException(
+                        "分面 " + facet.field + " 存在空的已选值");
+                }
+                if (!dedup.insert(value).second) {
+                    throw ValidationException(
+                        "分面 " + facet.field + " 存在重复的已选值: " + value);
+                }
+            }
+        }
+    }
+
+    if (request.from < 0) {
+        throw ValidationException("分页 from 不能为负");
+    }
+    if (request.size <= 0) {
+        throw ValidationException("分页 size 必须为正数");
+    }
+    if (static_cast<long>(request.from) + request.size > request.maxResultWindow) {
+        throw ValidationException(
+            "分页超出允许范围: from + size = " +
+            std::to_string(request.from + request.size) +
+            " > " + std::to_string(request.maxResultWindow));
+    }
+}
+
+FacetedSearchResult ESClient::parseFacetedResponse(
+        const json& response,
+        const FacetedSearchRequest& request) const {
+    FacetedSearchResult result;
+    result.took = response.value("took", 0);
+    result.timedOut = response.value("timed_out", false);
+
+    const auto& hitsNode = response["hits"];
+    const auto& total = hitsNode["total"];
+    result.total = total.is_object() ? total.value("value", 0)
+                                     : total.get<int>();
+    // ES 在无命中时返回 max_score: null
+    result.maxScore = hitsNode["max_score"].is_number()
+                          ? hitsNode["max_score"].get<double>()
+                          : 0.0;
+
+    for (const auto& hit : hitsNode["hits"]) {
+        SearchHit searchHit;
+        searchHit.id = hit.value("_id", "");
+        searchHit.index = hit.value("_index", "");
+        searchHit.score = hit["_score"].is_number()
+                              ? hit["_score"].get<double>()
+                              : 0.0;
+        searchHit.source = hit.value("_source", json::object());
+        searchHit.highlight = hit.value("highlight", json::object());
+        result.hits.push_back(std::move(searchHit));
+    }
+
+    // 响应中的聚合键固定为 aggregations（请求体里才可简写为 aggs）
+    static const json emptyObject = json::object();
+    const json& aggregations =
+        response.contains("aggregations") && response["aggregations"].is_object()
+            ? response["aggregations"]
+            : emptyObject;
+    for (const auto& facet : request.facets) {
+        FacetResult facetResult;
+        facetResult.field = facet.field;
+        facetResult.type = facet.type;
+
+        const std::string aggName = facetAggName(facet.field);
+        if (facet.type == FacetFieldType::Keyword) {
+            std::set<std::string> returnedKeys;
+            if (aggregations.contains(aggName) &&
+                aggregations[aggName].contains(aggName)) {
+                for (const auto& bucket :
+                     aggregations[aggName][aggName]["buckets"]) {
+                    FacetBucket b;
+                    b.key = bucket.value("key", "");
+                    b.docCount = bucket.value("doc_count", 0L);
+                    returnedKeys.insert(b.key);
+                    facetResult.buckets.push_back(std::move(b));
+                }
+            }
+            // 已选但 ES 未返回的桶（doc_count=0 时 terms 聚合默认不返回），
+            // 以零计数补齐
+            for (const auto& selected : facet.selected) {
+                if (!returnedKeys.count(selected)) {
+                    FacetBucket b;
+                    b.key = selected;
+                    b.docCount = 0;
+                    facetResult.buckets.push_back(std::move(b));
+                }
+            }
+            // 稳定排序：docCount 降序，同数按 key 升序
+            std::sort(facetResult.buckets.begin(), facetResult.buckets.end(),
+                      [](const FacetBucket& a, const FacetBucket& b) {
+                          if (a.docCount != b.docCount)
+                              return a.docCount > b.docCount;
+                          return a.key < b.key;
+                      });
+            std::set<std::string> selectedSet(facet.selected.begin(),
+                                              facet.selected.end());
+            for (auto& b : facetResult.buckets) {
+                b.selected = selectedSet.count(b.key) > 0;
+            }
+        } else {
+            // 日期分面：以作用域文档数作为单桶暴露
+            FacetBucket b;
+            b.key = facet.dateFrom + ".." + facet.dateTo;
+            b.docCount = aggregations.contains(aggName)
+                             ? aggregations[aggName].value("doc_count", 0L)
+                             : 0L;
+            b.selected = isFacetActive(facet);
+            facetResult.buckets.push_back(std::move(b));
+        }
+        result.facets.push_back(std::move(facetResult));
+    }
+
+    return result;
+}
+
+FacetedSearchResult ESClient::facetedSearch(const std::string& indexName,
+                                            const FacetedSearchRequest& request) {
+    validateFacetedRequest(request);
+
+    // 顶层 query 只承载关键词：它同时约束命中列表与所有聚合；
+    // 无关键词时为 match_all（分面浏览/无关键词场景）。
+    json body = {
+        {"query", request.keyword.empty()
+                      ? json{{"match_all", json::object()}}
+                      : buildKeywordClause(request.keyword,
+                                           request.keywordFields)},
+        {"from", request.from},
+        {"size", request.size},
+        {"track_total_hits", true}
+    };
+
+    // post_filter 承载全部分面条件，只过滤命中列表、不影响聚合；
+    // 各分面聚合内再用 filter 排除自身、保留其他分面。
+    bool anyActiveFacet = false;
+    for (const auto& facet : request.facets) {
+        if (isFacetActive(facet)) { anyActiveFacet = true; break; }
+    }
+    if (anyActiveFacet) {
+        body["post_filter"] = buildScopeQuery(request, "");
+    }
+
+    if (request.highlight) {
+        body["highlight"] = {
+            {"pre_tags", {"<em>"}},
+            {"post_tags", {"</em>"}},
+            {"fields", {
+                {"title", json::object()},
+                {"content", json::object()}
+            }}
+        };
+    }
+
+    if (!request.facets.empty()) {
+        json aggregations = json::object();
+        for (const auto& facet : request.facets) {
+            aggregations[facetAggName(facet.field)] =
+                buildFacetAggregation(facet, request);
+        }
+        body["aggs"] = std::move(aggregations);
+    }
+
+    auto response = httpClient_.post(
+        buildUrl("/" + indexName + "/_search"),
+        body.dump()
+    );
+    if (!response.isSuccess()) {
+        throw ESException("Faceted search failed: " + response.body);
+    }
+
+    return parseFacetedResponse(json::parse(response.body), request);
 }
 
 } // namespace es

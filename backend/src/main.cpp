@@ -346,8 +346,88 @@ void demoHighlightSearch(ESClient& client, const std::string& indexName) {
     }
 }
 
+void demoFacetedSearch(ESClient& client, const std::string& indexName) {
+    printSection(9, "分面搜索演示（边选边缩小范围）");
+
+    // 选题场景：关键词 "学习"，分类勾选 "技术"，标签多选 "深度学习"/"神经网络"
+    FacetedSearchRequest request;
+    request.keyword = "学习";
+    request.facets = {
+        FacetSpec::keyword("category", {"技术"}),
+        FacetSpec::keyword("author", {}),
+        FacetSpec::keyword("tags", {"深度学习", "神经网络"}),
+        FacetSpec::date("created_at", "2024-01-01", "2024-12-31")
+    };
+    request.from = 0;
+    request.size = 10;
+
+    printInfo("关键词: \"" + request.keyword + "\"");
+    std::cout << "  已选筛选: 分类=技术(OR组内) 标签∈{深度学习, 神经网络}(OR) "
+                 "日期=[2024-01-01, 2024-12-31)，分面间 AND\n";
+
+    try {
+        auto result = client.facetedSearch(indexName, request);
+
+        std::cout << "\n  " << Color::BOLD << "总命中: " << result.total
+                  << Color::RESET << " 篇 (耗时 " << result.took << "ms)\n";
+
+        // 当前筛选下回看（桶统计已排除自身分面，展示的是“下一步可选数量”）
+        for (const auto& facet : result.facets) {
+            std::cout << "\n  " << Color::MAGENTA << Color::BOLD
+                      << "分面 " << facet.field << Color::RESET << "\n";
+            if (facet.type == FacetFieldType::Date) {
+                for (const auto& bucket : facet.buckets) {
+                    std::cout << "    当前日期范围下可选文档数: "
+                              << Color::BOLD << bucket.docCount << Color::RESET
+                              << " (已应用范围: "
+                              << (bucket.selected ? "是" : "否") << ")\n";
+                }
+                continue;
+            }
+            for (const auto& bucket : facet.buckets) {
+                std::string mark = bucket.selected ? "[x]" : "[ ]";
+                std::cout << "    " << mark << " " << bucket.key
+                          << ": " << Color::BOLD << bucket.docCount
+                          << Color::RESET << "\n";
+            }
+        }
+
+        // 命中列表应用全部条件，并与高亮同时返回
+        std::cout << "\n  " << Color::CYAN << "命中文章:" << Color::RESET << "\n";
+        if (result.hits.empty()) {
+            std::cout << "    （无命中，可尝试取消部分分面选项）\n";
+        }
+        for (const auto& hit : result.hits) {
+            std::cout << "    • "
+                      << Color::BOLD << hit.source["title"].get<std::string>()
+                      << Color::RESET
+                      << " [" << hit.source["category"].get<std::string>()
+                      << "/" << hit.source["author"].get<std::string>() << "]\n";
+            if (hit.highlight.contains("content")) {
+                std::string text = hit.highlight["content"][0].get<std::string>();
+                if (text.length() > 72) text = text.substr(0, 72) + "...";
+                size_t pos = 0;
+                while ((pos = text.find("<em>", pos)) != std::string::npos) {
+                    text.replace(pos, 4, Color::RED + Color::BOLD);
+                    pos += Color::RED.length() + Color::BOLD.length();
+                }
+                pos = 0;
+                while ((pos = text.find("</em>", pos)) != std::string::npos) {
+                    text.replace(pos, 5, Color::RESET);
+                    pos += Color::RESET.length();
+                }
+                std::cout << "      " << Color::CYAN << text << Color::RESET << "\n";
+            }
+        }
+    } catch (const ValidationException& e) {
+        printError(std::string("请求参数被拒绝（未发往 ES）: ") + e.what());
+    } catch (const std::exception& e) {
+        printError(std::string("分面搜索失败: ") + e.what());
+    }
+}
+
 void demoDocumentCRUD(ESClient& client, const std::string& indexName) {
-    printSection(9, "文档 CRUD 操作演示");
+    printSection(10, "文档 CRUD 操作演示");
     
     // 创建文档
     printInfo("创建新文档...");
@@ -392,7 +472,7 @@ void demoDocumentCRUD(ESClient& client, const std::string& indexName) {
 }
 
 void demoCleanup(ESClient& client, const std::string& indexName) {
-    printSection(10, "清理资源");
+    printSection(11, "清理资源");
     
     try {
         client.deleteIndex(indexName);
@@ -455,6 +535,7 @@ int main() {
         demoTermSearch(client, indexName);
         demoBoolSearch(client, indexName);
         demoHighlightSearch(client, indexName);
+        demoFacetedSearch(client, indexName);
         demoDocumentCRUD(client, indexName);
         demoCleanup(client, indexName);
         
