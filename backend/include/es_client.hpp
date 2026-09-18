@@ -34,6 +34,86 @@ struct SearchResult {
     bool timedOut;
 };
 
+// ==================== 分面搜索 ====================
+
+/**
+ * 分面类型
+ */
+enum class FacetType {
+    Terms,     // 词条分面：keyword 字段，多选值按 OR 组合
+    DateRange  // 日期分面：date 字段，按闭开区间 [from, to) 过滤
+};
+
+/**
+ * 分面定义：声明需要对哪个字段统计可选数量
+ */
+struct FacetDef {
+    std::string field;  // 分面字段（须在允许的分面字段白名单内）
+    int size = 10;      // 返回桶数量上限
+};
+
+/**
+ * 词条分面选择：同一分面内多个选中值按 OR 解释
+ */
+struct FacetSelection {
+    std::string field;               // 分面字段
+    std::vector<std::string> values; // 选中的值（OR）
+};
+
+/**
+ * 日期范围选择：闭开区间 [from, to)，格式 yyyy-MM-dd，空串表示该侧不限
+ */
+struct DateRangeSelection {
+    std::string field; // 日期分面字段
+    std::string from;  // 起始日期（含）
+    std::string to;    // 结束日期（不含）
+};
+
+/**
+ * 分面搜索请求
+ *
+ * 语义：
+ * - 命中列表应用关键词与全部已选分面条件；
+ * - 同一分面内多选按 OR，不同分面之间按 AND；
+ * - 每个分面的桶在保留关键词和其他分面条件的同时排除自身过滤。
+ */
+struct FacetSearchRequest {
+    std::string keyword;                            // 关键词，空表示不限（match_all）
+    std::vector<std::string> keywordFields;         // 关键词检索字段，空则默认 title、content
+    std::vector<FacetDef> facets;                   // 需要统计的分面
+    std::vector<FacetSelection> selections;         // 词条分面已选值
+    std::vector<DateRangeSelection> dateSelections; // 日期分面已选范围
+    std::vector<std::string> highlightFields;       // 高亮字段（可空）
+    int from = 0;                                   // 分页偏移
+    int size = 10;                                  // 分页大小
+};
+
+/**
+ * 分面桶
+ */
+struct FacetBucket {
+    std::string key;       // 桶键名
+    long count = 0;        // 该值在「排除本面过滤」条件下的可选数量
+    bool selected = false; // 是否为当前已选值
+};
+
+/**
+ * 单个分面的统计结果
+ */
+struct FacetResult {
+    std::string field;
+    FacetType type = FacetType::Terms;
+    std::vector<FacetBucket> buckets; // 数量降序，同数按键名升序
+};
+
+/**
+ * 分面搜索结果：命中列表 + 各分面统计
+ */
+struct FacetSearchResult {
+    SearchResult search;             // 命中列表（应用关键词与全部已选条件）
+    std::vector<FacetResult> facets; // 各分面统计（各自排除自身过滤）
+};
+
 /**
  * 文档操作结果
  */
@@ -214,6 +294,18 @@ public:
                                      int from = 0,
                                      int size = 10);
     
+    /**
+     * 分面搜索：一次请求同时返回命中列表与各分面统计
+     *
+     * - 命中列表应用关键词与全部已选条件（同一分面内 OR，分面间 AND）；
+     * - 每个分面的桶保留关键词与其他分面条件，仅排除自身过滤，
+     *   因此已选分类不会把其他分类的计数压成零；
+     * - 未出现在返回桶里的已选值以零计数保留；
+     * - 非法字段、倒置日期范围、越界分页抛出 ESException，不会拼入查询。
+     */
+    FacetSearchResult facetSearch(const std::string& indexName,
+                                  const FacetSearchRequest& request);
+
     /**
      * 通用搜索（自定义查询体）
      */

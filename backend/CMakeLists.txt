@@ -36,18 +36,20 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CURL_INCLUDE_DIRS})
 
-# 源文件
-set(SOURCES
-    src/main.cpp
+# 客户端库源文件（演示程序与集成测试共用）
+set(CLIENT_SOURCES
     src/http_client.cpp
     src/es_client.cpp
+    src/facet_search.cpp
 )
 
-# 可执行文件
-add_executable(es_demo ${SOURCES})
-
-# 链接库
+# 演示程序
+add_executable(es_demo src/main.cpp ${CLIENT_SOURCES})
 target_link_libraries(es_demo PRIVATE ${CURL_LIBRARIES})
+
+# 分面搜索集成测试（需连接 Elasticsearch 运行）
+add_executable(facet_integration_test tests/facet_integration_test.cpp ${CLIENT_SOURCES})
+target_link_libraries(facet_integration_test PRIVATE ${CURL_LIBRARIES})
 
 # 安装规则
 install(TARGETS es_demo DESTINATION bin)

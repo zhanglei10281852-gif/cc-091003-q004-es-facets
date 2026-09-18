@@ -27,6 +27,7 @@ COPY CMakeLists.txt .
 COPY include/http_client.hpp include/
 COPY include/es_client.hpp include/
 COPY src/ src/
+COPY tests/ tests/
 COPY data/ data/
 
 # 构建项目
@@ -51,6 +52,7 @@ WORKDIR /app
 
 # 从构建阶段复制可执行文件和数据
 COPY --from=builder /app/build/es_demo .
+COPY --from=builder /app/build/facet_integration_test .
 COPY --from=builder /app/build/data ./data
 
 # 设置文件权限

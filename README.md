@@ -88,6 +88,15 @@ make
 - ✅ 高亮显示
 - ✅ 分页查询
 
+### 分面搜索（选题助手）
+
+- ✅ 一次请求同时返回命中列表与各分面统计
+- ✅ 同一分面内多选按 OR，不同分面之间按 AND
+- ✅ 分面桶排除自身过滤（已选分类不会把其他分类计数压成零）
+- ✅ 日期范围闭开区间 `[from, to)`
+- ✅ 桶按数量降序、同数按键名升序；已选值无匹配时以零计数保留
+- ✅ 非法字段、倒置日期、越界分页在校验阶段拒绝，不拼入查询
+
 ### 分词说明
 
 本 Demo 使用 Elasticsearch 内置的 `standard` 分词器。`standard` 分词器对中文采用单字切分（Unigram），例如"人工智能"会被切分为"人"、"工"、"智"、"能"四个 token。
@@ -116,13 +125,16 @@ make
 │   ├── CMakeLists.txt      # CMake 构建配置
 │   ├── Dockerfile          # Docker 镜像构建
 │   ├── include/            # 头文件
-│   │   ├── es_client.hpp   # ES 客户端类
+│   │   ├── es_client.hpp   # ES 客户端类（含分面搜索类型）
 │   │   ├── http_client.hpp # HTTP 客户端类
 │   │   └── json.hpp        # nlohmann/json 库
 │   ├── src/                # 源代码
-│   │   ├── main.cpp        # 主程序入口
+│   │   ├── main.cpp        # 主程序入口（含分面搜索演示）
 │   │   ├── es_client.cpp   # ES 客户端实现
+│   │   ├── facet_search.cpp# 分面搜索实现
 │   │   └── http_client.cpp # HTTP 客户端实现
+│   ├── tests/              # 集成测试
+│   │   └── facet_integration_test.cpp # 分面搜索集成测试
 │   └── data/               # 示例数据
 │       └── sample_data.json
 ├── docs/                   # 文档
@@ -140,7 +152,24 @@ make
 2. **批量导入** - 导入示例文章数据
 3. **全文检索** - 演示各种搜索方式
 4. **高亮显示** - 展示搜索结果高亮
-5. **清理资源** - 删除测试索引
+5. **分面搜索** - 选题助手：一次请求返回命中列表与各分面可选数量
+6. **清理资源** - 删除测试索引
+
+### 分面搜索 API
+
+```cpp
+es::FacetSearchRequest req;
+req.keyword = "学习";                                  // 关键词（可空）
+req.facets = {{"category", 10}, {"author", 10},
+              {"tags", 10}, {"created_at", 10}};      // 声明要统计的分面
+req.selections = {{"category", {"技术", "架构"}}};     // 词条分面多选（OR）
+req.dateSelections = {{"created_at", "2024-01-01", "2024-05-01"}}; // 闭开区间
+req.highlightFields = {"title", "content"};            // 高亮（可空）
+
+auto result = client.facetSearch("articles", req);
+// result.search —— 命中列表（应用关键词与全部已选条件）
+// result.facets —— 各分面桶（排除自身过滤；已选值无匹配时以 0 计数保留）
+```
 
 ### 输出示例
 
@@ -166,13 +195,44 @@ make
   标题: 深度学习实战
   高亮: ...<em>深度学习</em>是机器学习的一个分支...
 
-[4] 清理资源...
+[9] 分面搜索演示（选题助手）
+  当前筛选: 分类=技术|架构, 发布日期 >=2024-01-01 且 <2024-05-01
+  总命中: 3 条
+  下一步可选（各分面可选数量）:
+    分类:
+      ✓ 技术 (3) [已选]
+        编程语言 (1)
+      ✓ 架构 (0) [已选]      ← 已选值无匹配时以零计数保留
+    作者:
+        张三 (1)
+        李四 (1)
+        王五 (1)
+    ...
+
+[11] 清理资源...
 ✓ 索引删除成功
 
 ========================================
   演示完成！
 ========================================
 ```
+
+## 集成测试
+
+`backend/tests/facet_integration_test.cpp` 覆盖分面搜索的关键场景：多选组合（分面内 OR、分面间 AND）、零命中、无关键词、高亮与统计同时返回、已选值零计数保留、日期闭开区间边界、桶排序以及非法参数校验。
+
+```bash
+# 方式一：Docker（先构建镜像并启动 ES）
+docker-compose build cpp-demo
+docker-compose up -d elasticsearch
+docker-compose run --rm cpp-demo ./facet_integration_test
+
+# 方式二：本地（ES 已启动）
+cd backend/build && cmake .. && make
+ES_HOST=localhost ES_PORT=9200 ./facet_integration_test
+```
+
+测试通过标准输出打印每项断言结果，全部通过时退出码为 0。
 
 ## 扩展开发
 

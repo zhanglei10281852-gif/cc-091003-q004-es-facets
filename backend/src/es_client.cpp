@@ -265,7 +265,10 @@ SearchResult ESClient::parseSearchResponse(const json& response) {
     const auto& hits = response["hits"];
     const auto& total = hits["total"];
     result.total = total.is_object() ? total.value("value", 0) : total.get<int>();
-    result.maxScore = hits.value("max_score", 0.0);
+    // 零命中时 ES 返回 "max_score": null
+    result.maxScore = hits.contains("max_score") && hits["max_score"].is_number()
+                          ? hits["max_score"].get<double>()
+                          : 0.0;
     
     for (const auto& hit : hits["hits"]) {
         SearchHit searchHit;
